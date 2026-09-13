@@ -51,7 +51,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out the PR branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           # Literal on purpose: the env context is not reliably available in a
           # step's `with:` block. Keep this in sync with PR_BRANCH below.
