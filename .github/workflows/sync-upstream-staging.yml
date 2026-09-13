@@ -14,13 +14,12 @@
 # the repo owner when a *scheduled* workflow fails, so that is your signal -
 # no issue tracker needed (forks have Issues disabled by default).
 #
-# TRADE-OFFS:
-#   * Every successful run adds a merge commit. GitHub does not start new
-#     workflow runs for pushes made with GITHUB_TOKEN (recursion guard), so do
-#     not rely on these commits re-running the PR's checks.
-#   * If you want detect-only, set PUSH_ON_CLEAN to "false" - then it only ever
-#     emails you when a conflict appears.
-#   * To reduce merge-commit churn, change the cron to once a day.
+# MODE: detect-only. PUSH_ON_CLEAN is "false", so a clean merge is a silent no-op
+# (the job still succeeds, no notification) and this workflow fails - and therefore
+# emails you - ONLY when upstream genuinely conflicts. Set PUSH_ON_CLEAN to "true"
+# to also auto-heal the branch with a merge commit on every run (note: pushes made
+# with GITHUB_TOKEN do not trigger further workflow runs, so auto-merge commits
+# would not re-run the PR's checks).
 #
 # COST NOTE: fetch-depth 0 pulls the full history (~minutes, ~1.5 GB for litellm).
 # That is the reliable option. `filter: blob:none` is far lighter but can hit
@@ -44,7 +43,8 @@ concurrency:
 env:
   PR_BRANCH: feature/llm-shield-guardrail
   UPSTREAM_BRANCH: litellm_internal_staging
-  PUSH_ON_CLEAN: "true"
+  # false = detect-only: never push, and only fail (= only email) on a real conflict.
+  PUSH_ON_CLEAN: "false"
 
 jobs:
   sync:
@@ -69,12 +69,16 @@ jobs:
           git remote add upstream https://github.com/BerriAI/litellm.git
           git fetch --no-tags upstream "$UPSTREAM_BRANCH"
 
-      - name: Merge upstream staging
+      - name: Test-merge upstream staging (nothing is kept in detect-only mode)
         id: merge
         run: |
           if git merge --no-edit "upstream/$UPSTREAM_BRANCH"; then
             echo "status=clean" >> "$GITHUB_OUTPUT"
+            echo "Clean merge - no conflict to report."
           else
+            # Record WHICH files conflict before aborting, so the notification
+            # actually tells you what to fix.
+            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
             git merge --abort
             echo "status=conflict" >> "$GITHUB_OUTPUT"
           fi
@@ -94,13 +98,24 @@ jobs:
             git push origin "HEAD:$PR_BRANCH"
           fi
 
-      - name: Fail loudly on a real conflict
+      - name: Notify on a genuine conflict
         if: steps.merge.outputs.status == 'conflict'
         run: |
-          echo "::error::upstream/$UPSTREAM_BRANCH now conflicts with $PR_BRANCH."
-          echo "Resolve locally, e.g. from C:/git_repo/litellm:"
-          echo "  git fetch upstream $UPSTREAM_BRANCH"
-          echo "  git merge upstream/$UPSTREAM_BRANCH"
-          echo "  # keep BOTH sides at each conflict, then:"
-          echo "  git commit && git push origin $PR_BRANCH"
+          echo "::error::upstream/$UPSTREAM_BRANCH now conflicts with $PR_BRANCH. Conflicting files:"
+          while read -r f; do echo "::error::  $f"; done < "$RUNNER_TEMP/conflicts.txt"
+
+          {
+            echo "### Conflicting files"
+            echo ""
+            while read -r f; do echo "- \`$f\`"; done < "$RUNNER_TEMP/conflicts.txt"
+            echo ""
+            echo "Resolve, then push:"
+            echo '```'
+            echo "cd C:/git_repo/litellm"
+            echo "git fetch upstream $UPSTREAM_BRANCH"
+            echo "git merge upstream/$UPSTREAM_BRANCH"
+            echo "# keep BOTH sides at each conflict, then:"
+            echo "git commit && git push origin $PR_BRANCH"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
           exit 1
