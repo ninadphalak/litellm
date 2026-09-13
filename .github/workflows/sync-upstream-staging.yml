@@ -1,0 +1,106 @@
+# Keeps ninadphalak/litellm:feature/llm-shield-guardrail mergeable against
+# BerriAI/litellm:litellm_internal_staging without needing a human at a desk.
+#
+# INSTALL TARGET: the fork's DEFAULT branch (litellm_internal_staging) -- NOT
+# feature/llm-shield-guardrail. Scheduled workflows only run from the default
+# branch, and this file must never appear in the PR diff (the PR's base is the
+# parent repo's branch, so a commit on the fork's default branch is invisible to
+# the PR).
+#
+# ONE-TIME SETUP: fork -> Actions tab -> "I understand my workflows, go ahead and
+# enable them".  Forked repos have Actions disabled until you do that.
+#
+# HOW IT NOTIFIES: when the merge conflicts it aborts and exits 1. GitHub emails
+# the repo owner when a *scheduled* workflow fails, so that is your signal -
+# no issue tracker needed (forks have Issues disabled by default).
+#
+# TRADE-OFFS:
+#   * Every successful run adds a merge commit. GitHub does not start new
+#     workflow runs for pushes made with GITHUB_TOKEN (recursion guard), so do
+#     not rely on these commits re-running the PR's checks.
+#   * If you want detect-only, set PUSH_ON_CLEAN to "false" - then it only ever
+#     emails you when a conflict appears.
+#   * To reduce merge-commit churn, change the cron to once a day.
+#
+# COST NOTE: fetch-depth 0 pulls the full history (~minutes, ~1.5 GB for litellm).
+# That is the reliable option. `filter: blob:none` is far lighter but can hit
+# "upload-pack: not our ref" when a needed blob only exists upstream, so it is
+# deliberately not used here.
+
+name: keep guardrail branch current
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-guardrail-branch
+  cancel-in-progress: false
+
+env:
+  PR_BRANCH: feature/llm-shield-guardrail
+  UPSTREAM_BRANCH: litellm_internal_staging
+  PUSH_ON_CLEAN: "true"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the PR branch
+        uses: actions/checkout@v4
+        with:
+          # Literal on purpose: the env context is not reliably available in a
+          # step's `with:` block. Keep this in sync with PR_BRANCH below.
+          ref: feature/llm-shield-guardrail
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set commit identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream staging
+        run: |
+          git remote add upstream https://github.com/BerriAI/litellm.git
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+
+      - name: Merge upstream staging
+        id: merge
+        run: |
+          if git merge --no-edit "upstream/$UPSTREAM_BRANCH"; then
+            echo "status=clean" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push the refreshed branch
+        # No env.* in this `if:` either - the guard is evaluated inside the shell,
+        # where the job-level env vars are definitely exported.
+        if: steps.merge.outputs.status == 'clean'
+        run: |
+          if [ "$PUSH_ON_CLEAN" != "true" ]; then
+            echo "PUSH_ON_CLEAN=$PUSH_ON_CLEAN - detect-only mode, not pushing."
+            exit 0
+          fi
+          if git diff --quiet "origin/$PR_BRANCH" HEAD; then
+            echo "Already up to date; nothing to push."
+          else
+            git push origin "HEAD:$PR_BRANCH"
+          fi
+
+      - name: Fail loudly on a real conflict
+        if: steps.merge.outputs.status == 'conflict'
+        run: |
+          echo "::error::upstream/$UPSTREAM_BRANCH now conflicts with $PR_BRANCH."
+          echo "Resolve locally, e.g. from C:/git_repo/litellm:"
+          echo "  git fetch upstream $UPSTREAM_BRANCH"
+          echo "  git merge upstream/$UPSTREAM_BRANCH"
+          echo "  # keep BOTH sides at each conflict, then:"
+          echo "  git commit && git push origin $PR_BRANCH"
+          exit 1
