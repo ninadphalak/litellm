@@ -1,5 +1,5 @@
 # Keeps ninadphalak/litellm:feature/llm-shield-guardrail mergeable against
-# BerriAI/litellm:litellm_internal_staging without needing a human at a desk.
+# BerriAI/litellm:main without needing a human at a desk.
 #
 # INSTALL TARGET: the fork's DEFAULT branch (litellm_internal_staging) -- NOT
 # feature/llm-shield-guardrail. Scheduled workflows only run from the default
@@ -42,7 +42,7 @@ concurrency:
 
 env:
   PR_BRANCH: feature/llm-shield-guardrail
-  UPSTREAM_BRANCH: litellm_internal_staging
+  UPSTREAM_BRANCH: main
   # false = detect-only: never push, and only fail (= only email) on a real conflict.
   PUSH_ON_CLEAN: "false"
 
@@ -64,12 +64,12 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Fetch upstream staging
+      - name: Fetch upstream main
         run: |
           git remote add upstream https://github.com/BerriAI/litellm.git
           git fetch --no-tags upstream "$UPSTREAM_BRANCH"
 
-      - name: Test-merge upstream staging (nothing is kept in detect-only mode)
+      - name: Test-merge upstream main (nothing is kept in detect-only mode)
         id: merge
         run: |
           if git merge --no-edit "upstream/$UPSTREAM_BRANCH"; then
