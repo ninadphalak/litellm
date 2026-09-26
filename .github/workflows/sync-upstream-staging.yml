@@ -1,30 +1,23 @@
-# Keeps ninadphalak/litellm:feature/llm-shield-guardrail mergeable against
-# BerriAI/litellm:main without needing a human at a desk.
+# Keeps ninadphalak/litellm:feature/llm-shield-guardrail (BerriAI/litellm#42645) mergeable
+# against BerriAI/litellm:main, and keeps the PR from being auto-closed as stale.
 #
 # INSTALL TARGET: the fork's DEFAULT branch (litellm_internal_staging) -- NOT
-# feature/llm-shield-guardrail. Scheduled workflows only run from the default
-# branch, and this file must never appear in the PR diff (the PR's base is the
-# parent repo's branch, so a commit on the fork's default branch is invisible to
-# the PR).
+# feature/llm-shield-guardrail. Scheduled workflows only run from the default branch, and
+# this file must never appear in the PR diff.
 #
-# ONE-TIME SETUP: fork -> Actions tab -> "I understand my workflows, go ahead and
-# enable them".  Forked repos have Actions disabled until you do that.
+# WHAT CAN CLOSE THE PR: upstream's stale.yml marks a PR stale after 90 days without
+# activity (its own comment says it may go back to 60) and closes it 7 days later. Any push
+# to the PR branch counts as activity. (#39621 was closed a different way: its base branch
+# was deleted. The base is now `main`, so that cannot recur.)
 #
-# HOW IT NOTIFIES: when the merge conflicts it aborts and exits 1. GitHub emails
-# the repo owner when a *scheduled* workflow fails, so that is your signal -
-# no issue tracker needed (forks have Issues disabled by default).
-#
-# MODE: detect-only. PUSH_ON_CLEAN is "false", so a clean merge is a silent no-op
-# (the job still succeeds, no notification) and this workflow fails - and therefore
-# emails you - ONLY when upstream genuinely conflicts. Set PUSH_ON_CLEAN to "true"
-# to also auto-heal the branch with a merge commit on every run (note: pushes made
-# with GITHUB_TOKEN do not trigger further workflow runs, so auto-merge commits
-# would not re-run the PR's checks).
-#
-# COST NOTE: fetch-depth 0 pulls the full history (~minutes, ~1.5 GB for litellm).
-# That is the reliable option. `filter: blob:none` is far lighter but can hit
-# "upload-pack: not our ref" when a needed blob only exists upstream, so it is
-# deliberately not used here.
+# WHAT THIS DOES, every 6 hours:
+#   1. Test-merges upstream main into the PR branch.
+#      - Conflict: fails, so GitHub emails the owner, and lists the conflicting files.
+#      - Clean: if the branch's newest commit is older than REFRESH_AFTER_DAYS, pushes the
+#        merge. That keeps the branch current and resets the stale clock long before 60
+#        days, while leaving a branch that is being worked on alone.
+#   2. Checks the PR itself: it fails (and so emails you) if the PR was closed without
+#      being merged, or has picked up the `stale` label. A merged PR ends the job quietly.
 
 name: keep guardrail branch current
 
@@ -32,6 +25,11 @@ on:
   schedule:
     - cron: "23 */6 * * *"
   workflow_dispatch:
+    inputs:
+      force_refresh:
+        description: "Push a clean merge of upstream main now, whatever the branch's age"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -42,19 +40,54 @@ concurrency:
 
 env:
   PR_BRANCH: feature/llm-shield-guardrail
+  UPSTREAM_REPO: BerriAI/litellm
   UPSTREAM_BRANCH: main
-  # false = detect-only: never push, and only fail (= only email) on a real conflict.
-  PUSH_ON_CLEAN: "false"
+  PR_NUMBER: "42645"
+  # Well inside upstream's stale window (90 days, possibly 60), rarely enough that the
+  # PR's full CI does not rerun for nothing.
+  REFRESH_AFTER_DAYS: "21"
 
 jobs:
+  pr-state:
+    runs-on: ubuntu-latest
+    outputs:
+      state: ${{ steps.state.outputs.state }}
+    steps:
+      - name: Check the PR is still open and not marked stale
+        id: state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pr=$(gh api "repos/$UPSTREAM_REPO/pulls/$PR_NUMBER")
+          state=$(jq -r .state <<<"$pr")
+          merged=$(jq -r .merged <<<"$pr")
+          labels=$(jq -r '[.labels[].name] | join(",")' <<<"$pr")
+          echo "state=$state merged=$merged labels=$labels"
+          if [ "$merged" = "true" ]; then
+            echo "state=merged" >> "$GITHUB_OUTPUT"
+            echo "### #$PR_NUMBER is merged. Disable this workflow." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$state" != "open" ]; then
+            echo "state=closed" >> "$GITHUB_OUTPUT"
+            echo "::error::$UPSTREAM_REPO#$PR_NUMBER was closed without being merged."
+            exit 1
+          fi
+          echo "state=open" >> "$GITHUB_OUTPUT"
+          if [[ ",$labels," == *",stale,"* ]]; then
+            echo "::error::$UPSTREAM_REPO#$PR_NUMBER is labelled stale; it closes 7 days later without activity."
+            exit 1
+          fi
+
   sync:
+    needs: pr-state
+    if: always() && needs.pr-state.outputs.state == 'open'
     runs-on: ubuntu-latest
     steps:
       - name: Check out the PR branch
         uses: actions/checkout@v5
         with:
-          # Literal on purpose: the env context is not reliably available in a
-          # step's `with:` block. Keep this in sync with PR_BRANCH below.
+          # Literal on purpose: the env context is not reliably available in `with:`.
           ref: feature/llm-shield-guardrail
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -66,55 +99,53 @@ jobs:
 
       - name: Fetch upstream main
         run: |
-          git remote add upstream https://github.com/BerriAI/litellm.git
+          git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
           git fetch --no-tags upstream "$UPSTREAM_BRANCH"
 
-      - name: Test-merge upstream main (nothing is kept in detect-only mode)
+      - name: Test-merge upstream main
         id: merge
         run: |
           if git merge --no-edit "upstream/$UPSTREAM_BRANCH"; then
             echo "status=clean" >> "$GITHUB_OUTPUT"
-            echo "Clean merge - no conflict to report."
           else
-            # Record WHICH files conflict before aborting, so the notification
-            # actually tells you what to fix.
             git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
             git merge --abort
             echo "status=conflict" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Push the refreshed branch
-        # No env.* in this `if:` either - the guard is evaluated inside the shell,
-        # where the job-level env vars are definitely exported.
+      - name: Push the merge if the branch has gone quiet
         if: steps.merge.outputs.status == 'clean'
+        env:
+          FORCE: ${{ inputs.force_refresh }}
         run: |
-          if [ "$PUSH_ON_CLEAN" != "true" ]; then
-            echo "PUSH_ON_CLEAN=$PUSH_ON_CLEAN - detect-only mode, not pushing."
+          if git diff --quiet "origin/$PR_BRANCH" HEAD; then
+            echo "Already up to date with upstream $UPSTREAM_BRANCH."
             exit 0
           fi
-          if git diff --quiet "origin/$PR_BRANCH" HEAD; then
-            echo "Already up to date; nothing to push."
-          else
-            git push origin "HEAD:$PR_BRANCH"
+          newest=$(git log -1 --format=%ct "origin/$PR_BRANCH")
+          age_days=$(( ( $(date +%s) - newest ) / 86400 ))
+          echo "Newest commit on $PR_BRANCH is $age_days day(s) old."
+          if [ "$FORCE" != "true" ] && [ "$age_days" -lt "$REFRESH_AFTER_DAYS" ]; then
+            echo "Under $REFRESH_AFTER_DAYS days: merges cleanly, nothing pushed."
+            exit 0
           fi
+          git push origin "HEAD:$PR_BRANCH"
+          echo "### Refreshed $PR_BRANCH with upstream $UPSTREAM_BRANCH (branch was $age_days days quiet)" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Notify on a genuine conflict
+      - name: Report a genuine conflict
         if: steps.merge.outputs.status == 'conflict'
         run: |
           echo "::error::upstream/$UPSTREAM_BRANCH now conflicts with $PR_BRANCH. Conflicting files:"
           while read -r f; do echo "::error::  $f"; done < "$RUNNER_TEMP/conflicts.txt"
-
           {
             echo "### Conflicting files"
             echo ""
             while read -r f; do echo "- \`$f\`"; done < "$RUNNER_TEMP/conflicts.txt"
             echo ""
-            echo "Resolve, then push:"
+            echo "Resolve in the worktree, keeping both sides at each conflict, then push:"
             echo '```'
-            echo "cd C:/git_repo/litellm"
-            echo "git fetch upstream $UPSTREAM_BRANCH"
-            echo "git merge upstream/$UPSTREAM_BRANCH"
-            echo "# keep BOTH sides at each conflict, then:"
+            echo "cd C:/git_repo/litellm-shield-wt"
+            echo "git fetch upstream $UPSTREAM_BRANCH && git merge upstream/$UPSTREAM_BRANCH"
             echo "git commit && git push origin $PR_BRANCH"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
